@@ -1,16 +1,14 @@
 import chess.pgn
 import re
 import json
+import os
 
 def clk_to_seconds(clk_str):
     parts = clk_str.split(":")
     h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
     return h * 3600 + m * 60 + s
 
-def parse_game(pgn_path, player="black"):
-    with open(pgn_path) as f:
-        game = chess.pgn.read_game(f)
-
+def parse_game(game):
     board = game.board()
     moves = []
     prev_clk_white = None
@@ -85,20 +83,14 @@ def parse_game(pgn_path, player="black"):
         node = next_node
 
     # Label blunders
-    # eval is stored AFTER the move is made
-    # So moves[i]["eval"] is the position eval after player i moved
-    # A blunder means: the eval before your move was okay, after your move it's bad for you
-    # Before move i = moves[i-1]["eval"], after move i = moves[i]["eval"]
     for i in range(1, len(moves)):
         prev_eval = moves[i-1]["eval"]
         curr_eval = moves[i]["eval"]
         if prev_eval is not None and curr_eval is not None:
             eval_change = curr_eval - prev_eval
             if moves[i]["player"] == "white":
-                # White just moved, eval should improve (go more positive) — blunder if it dropped
                 moves[i]["is_blunder"] = 1 if eval_change <= -1.5 else 0
             else:
-                # Black just moved, eval should drop (go more negative) — blunder if it rose
                 moves[i]["is_blunder"] = 1 if eval_change >= 1.5 else 0
         else:
             moves[i]["is_blunder"] = 0
@@ -108,23 +100,45 @@ def parse_game(pgn_path, player="black"):
     return moves
 
 if __name__ == "__main__":
-    moves = parse_game("data/HbKF7UPv.pgn")
+    pgn_path = "data/raw/games.pgn"
+    output_path = "data/all_features.json"
 
-    print(f"{'Move':>4} | {'Player':>5} | {'Notation':>6} | {'TimeSpent':>9} | {'TimeRatio':>9} | {'Pressure':>8} | {'Eval':>6} | {'Trend':>6} | {'Legal':>5} | {'Blunder':>7}")
-    print("-" * 100)
+    all_moves = []
+    game_count = 0
+    skipped = 0
 
-    for m in moves:
-        flag = "🔴" if m["is_blunder"] else ""
-        print(f"{m['move_number']:>4} | {m['player']:>5} | {m['move']:>6} | "
-              f"{m['time_spent']:>9} | {m['time_ratio']:>9} | {m['time_pressure']:>8} | "
-              f"{str(m['eval']):>6} | {m['eval_trend']:>6} | {m['legal_moves']:>5} | "
-              f"{m['is_blunder']:>7} {flag}")
+    with open(pgn_path, encoding="utf-8") as f:
+        while True:
+            game = chess.pgn.read_game(f)
+            if game is None:
+                break
 
-    blunders = [m for m in moves if m["is_blunder"]]
-    print(f"\nTotal moves: {len(moves)} | Blunders detected: {len(blunders)}")
-    for b in blunders:
-        print(f"  Blunder at move {b['move_number']} by {b['player']}: {b['move']} | time_ratio: {b['time_ratio']} | pressure: {b['time_pressure']}")
+            try:
+                moves = parse_game(game)
+                # Only keep games with at least 20 moves and some evals
+                evals_present = sum(1 for m in moves if m["eval"] is not None)
+                if len(moves) >= 20 and evals_present >= 10:
+                    all_moves.extend(moves)
+                    game_count += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                skipped += 1
+                continue
 
-    with open("data/HbKF7UPv_features.json", "w") as f:
-        json.dump(moves, f, indent=2)
-    print("\nSaved features to data/HbKF7UPv_features.json")
+            if game_count % 50 == 0:
+                print(f"Processed {game_count} games, {len(all_moves)} total moves...")
+
+    blunders = sum(1 for m in all_moves if m.get("is_blunder") == 1)
+    non_blunders = sum(1 for m in all_moves if m.get("is_blunder") == 0)
+
+    print(f"\nDone!")
+    print(f"Games processed: {game_count} | Skipped: {skipped}")
+    print(f"Total moves: {len(all_moves)}")
+    print(f"Blunders: {blunders} ({100*blunders/len(all_moves):.1f}%)")
+    print(f"Non-blunders: {non_blunders}")
+
+    with open(output_path, "w") as f:
+        json.dump(all_moves, f)
+
+    print(f"\nSaved to {output_path}")
