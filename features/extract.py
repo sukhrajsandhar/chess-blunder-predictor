@@ -2,6 +2,7 @@ import chess.pgn
 import re
 import json
 import os
+import glob
 
 def clk_to_seconds(clk_str):
     parts = clk_str.split(":")
@@ -82,7 +83,6 @@ def parse_game(game):
         board.push(next_node.move)
         node = next_node
 
-    # Label blunders
     for i in range(1, len(moves)):
         prev_eval = moves[i-1]["eval"]
         curr_eval = moves[i]["eval"]
@@ -96,49 +96,43 @@ def parse_game(game):
             moves[i]["is_blunder"] = 0
 
     moves[0]["is_blunder"] = 0
-
     return moves
 
 if __name__ == "__main__":
-    pgn_path = "data/raw/games.pgn"
+    pgn_files = glob.glob("data/raw/*.pgn")
     output_path = "data/all_features.json"
 
     all_moves = []
     game_count = 0
     skipped = 0
 
-    with open(pgn_path, encoding="utf-8") as f:
-        while True:
-            game = chess.pgn.read_game(f)
-            if game is None:
-                break
-
-            try:
-                moves = parse_game(game)
-                # Only keep games with at least 20 moves and some evals
-                evals_present = sum(1 for m in moves if m["eval"] is not None)
-                if len(moves) >= 20 and evals_present >= 10:
-                    all_moves.extend(moves)
-                    game_count += 1
-                else:
+    for pgn_file in pgn_files:
+        print(f"Processing {pgn_file}...")
+        with open(pgn_file, encoding="utf-8") as f:
+            while True:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                try:
+                    moves = parse_game(game)
+                    evals_present = sum(1 for m in moves if m["eval"] is not None)
+                    if len(moves) >= 20 and evals_present >= 10:
+                        all_moves.extend(moves)
+                        game_count += 1
+                    else:
+                        skipped += 1
+                except Exception:
                     skipped += 1
-            except Exception as e:
-                skipped += 1
-                continue
+                    continue
 
-            if game_count % 50 == 0:
-                print(f"Processed {game_count} games, {len(all_moves)} total moves...")
+        print(f"  Running total: {game_count} games, {len(all_moves)} moves")
 
     blunders = sum(1 for m in all_moves if m.get("is_blunder") == 1)
-    non_blunders = sum(1 for m in all_moves if m.get("is_blunder") == 0)
-
     print(f"\nDone!")
-    print(f"Games processed: {game_count} | Skipped: {skipped}")
+    print(f"Games: {game_count} | Skipped: {skipped}")
     print(f"Total moves: {len(all_moves)}")
     print(f"Blunders: {blunders} ({100*blunders/len(all_moves):.1f}%)")
-    print(f"Non-blunders: {non_blunders}")
 
     with open(output_path, "w") as f:
         json.dump(all_moves, f)
-
-    print(f"\nSaved to {output_path}")
+    print(f"Saved to {output_path}")
