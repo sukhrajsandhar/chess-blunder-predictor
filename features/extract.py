@@ -1,207 +1,258 @@
-import chess
-import chess.pgn
-import re
 import json
-import os
-import glob
+import torch
+import torch.nn as nn
+import numpy as np
+import chess
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score, classification_report
+from lstm import BlunderPredictor
+import random
 
-def clk_to_seconds(clk_str):
-    parts = clk_str.split(":")
-    h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-    return h * 3600 + m * 60 + s
+SEQ_LEN = 10
+BATCH_SIZE = 512
+EPOCHS = 50
+LR = 0.001
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def get_game_phase(board, move_number):
-    total_material = sum(
-        len(board.pieces(pt, c)) * val
-        for pt, val in [(chess.QUEEN,9),(chess.ROOK,5),(chess.BISHOP,3),(chess.KNIGHT,3)]
-        for c in [chess.WHITE, chess.BLACK]
-    )
-    if move_number <= 10:
-        return 0
-    elif total_material <= 20:
-        return 2
-    else:
-        return 1
+FEATURES = [
+    "time_spent",
+    "time_ratio",
+    "time_pressure",
+    "eval",
+    "eval_trend",
+    "legal_moves",
+    "material_balance",
+    "move_number",
+    "player_elo",
+    "base_time",
+    "game_phase",
+]
 
-def board_to_tensor(board):
-    piece_map = {
-        (chess.PAWN,   chess.WHITE): 0,
-        (chess.KNIGHT, chess.WHITE): 1,
-        (chess.BISHOP, chess.WHITE): 2,
-        (chess.ROOK,   chess.WHITE): 3,
-        (chess.QUEEN,  chess.WHITE): 4,
-        (chess.KING,   chess.WHITE): 5,
-        (chess.PAWN,   chess.BLACK): 6,
-        (chess.KNIGHT, chess.BLACK): 7,
-        (chess.BISHOP, chess.BLACK): 8,
-        (chess.ROOK,   chess.BLACK): 9,
-        (chess.QUEEN,  chess.BLACK): 10,
-        (chess.KING,   chess.BLACK): 11,
-    }
-    tensor = [[[0]*8 for _ in range(8)] for _ in range(12)]
+PIECE_MAP = {
+    (chess.PAWN,   chess.WHITE): 0,
+    (chess.KNIGHT, chess.WHITE): 1,
+    (chess.BISHOP, chess.WHITE): 2,
+    (chess.ROOK,   chess.WHITE): 3,
+    (chess.QUEEN,  chess.WHITE): 4,
+    (chess.KING,   chess.WHITE): 5,
+    (chess.PAWN,   chess.BLACK): 6,
+    (chess.KNIGHT, chess.BLACK): 7,
+    (chess.BISHOP, chess.BLACK): 8,
+    (chess.ROOK,   chess.BLACK): 9,
+    (chess.QUEEN,  chess.BLACK): 10,
+    (chess.KING,   chess.BLACK): 11,
+}
+
+def fen_to_tensor(fen):
+    board = chess.Board(fen)
+    tensor = np.zeros((12, 8, 8), dtype=np.float32)
     for square, piece in board.piece_map().items():
         rank = square // 8
         file = square % 8
-        channel = piece_map[(piece.piece_type, piece.color)]
-        tensor[channel][rank][file] = 1
+        channel = PIECE_MAP[(piece.piece_type, piece.color)]
+        tensor[channel][rank][file] = 1.0
     return tensor
 
-def parse_game(game):
-    board = game.board()
-    moves = []
-    prev_clk_white = None
-    prev_clk_black = None
-    time_spent_history = []
-    eval_history = []
 
-    try:
-        white_elo = int(game.headers.get("WhiteElo", 1500))
-    except:
-        white_elo = 1500
-    try:
-        black_elo = int(game.headers.get("BlackElo", 1500))
-    except:
-        black_elo = 1500
+class ChessDataset(Dataset):
+    def __init__(self, games, mean, std):
+        self.mean = mean
+        self.std = std
+        self.samples = []
 
-    try:
-        tc = game.headers.get("TimeControl", "600+0")
-        base_time = int(tc.split("+")[0]) if "+" in tc else int(tc)
-    except:
-        base_time = 600
+        print(f"  Building sequences from {len(games)} games...")
+        for idx, moves in enumerate(games):
+            for i in range(SEQ_LEN, len(moves)):
+                window = moves[i - SEQ_LEN:i]
+                target = moves[i]
 
-    node = game
-    move_number = 0
+                feats = []
+                fens = []
+                valid = True
 
-    while node.variations:
-        next_node = node.variations[0]
-        comment = next_node.comment
-        move_number += 1
+                for m in window:
+                    row = []
+                    for f in FEATURES:
+                        val = m.get(f)
+                        if val is None:
+                            valid = False
+                            break
+                        row.append(float(val))
+                    if not valid:
+                        break
+                    feats.append(row)
+                    fens.append(m.get("fen", ""))
 
-        clk_match = re.search(r'\[%clk (\d+:\d+:\d+)\]', comment)
-        eval_match = re.search(r'\[%eval (-?\d+\.?\d*)\]', comment)
+                if valid and len(feats) == SEQ_LEN and all(fens):
+                    label = target.get("is_blunder", 0)
+                    if label is not None:
+                        self.samples.append((feats, fens, label))
 
-        clk_seconds = clk_to_seconds(clk_match.group(1)) if clk_match else None
-        eval_score = float(eval_match.group(1)) if eval_match else None
+            if (idx + 1) % 10000 == 0:
+                print(f"    {idx + 1} games, {len(self.samples)} sequences...")
 
-        is_white = (move_number % 2 == 1)
-        current_player = "white" if is_white else "black"
-        player_elo = white_elo if is_white else black_elo
+    def __len__(self):
+        return len(self.samples)
 
-        if is_white:
-            time_spent = (prev_clk_white - clk_seconds) if (prev_clk_white is not None and clk_seconds is not None) else 0
-            prev_clk_white = clk_seconds
-        else:
-            time_spent = (prev_clk_black - clk_seconds) if (prev_clk_black is not None and clk_seconds is not None) else 0
-            prev_clk_black = clk_seconds
-
-        time_spent = max(0, time_spent)
-        time_spent_history.append(time_spent)
-
-        avg_time = sum(time_spent_history) / len(time_spent_history) if time_spent_history else 1
-        time_ratio = time_spent / avg_time if avg_time > 0 else 1.0
-        time_pressure = 1 if (clk_seconds is not None and clk_seconds < 300) else 0
-
-        eval_history.append(eval_score if eval_score is not None else 0)
-        if len(eval_history) >= 3:
-            eval_trend = eval_history[-1] - eval_history[-3]
-        else:
-            eval_trend = 0.0
-
-        legal_moves = board.legal_moves.count()
-        game_phase = get_game_phase(board, move_number)
-
-        white_material = sum(
-            len(board.pieces(pt, chess.WHITE)) * val
-            for pt, val in [(chess.PAWN,1),(chess.KNIGHT,3),(chess.BISHOP,3),(chess.ROOK,5),(chess.QUEEN,9)]
+    def __getitem__(self, idx):
+        feats, fens, label = self.samples[idx]
+        x_tab = (np.array(feats, dtype=np.float32) - self.mean) / self.std
+        x_board = np.stack([fen_to_tensor(f) for f in fens])  # (seq_len, 12, 8, 8)
+        return (
+            torch.tensor(x_tab, dtype=torch.float32),
+            torch.tensor(x_board, dtype=torch.float32),
+            torch.tensor(label, dtype=torch.float32),
         )
-        black_material = sum(
-            len(board.pieces(pt, chess.BLACK)) * val
-            for pt, val in [(chess.PAWN,1),(chess.KNIGHT,3),(chess.BISHOP,3),(chess.ROOK,5),(chess.QUEEN,9)]
-        )
-        material_balance = white_material - black_material
 
-        board_tensor = board_to_tensor(board)
 
-        moves.append({
-            "move_number": move_number,
-            "player": current_player,
-            "move": next_node.move.uci(),
-            "clk_seconds": clk_seconds,
-            "time_spent": time_spent,
-            "time_ratio": round(time_ratio, 3),
-            "time_pressure": time_pressure,
-            "eval": eval_score,
-            "eval_trend": round(eval_trend, 3),
-            "legal_moves": legal_moves,
-            "material_balance": material_balance,
-            "player_elo": player_elo,
-            "base_time": base_time,
-            "game_phase": game_phase,
-            "board": board_tensor,
-        })
+def train():
+    print(f"Using device: {DEVICE}")
+    if DEVICE.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-        board.push(next_node.move)
-        node = next_node
+    print("Loading data...")
+    with open("../data/all_features.json") as f:
+        all_moves = json.load(f)
 
-    for i in range(1, len(moves)):
-        prev_eval = moves[i-1]["eval"]
-        curr_eval = moves[i]["eval"]
-        if prev_eval is not None and curr_eval is not None:
-            eval_change = curr_eval - prev_eval
-            if moves[i]["player"] == "white":
-                moves[i]["is_blunder"] = 1 if eval_change <= -1.5 else 0
-            else:
-                moves[i]["is_blunder"] = 1 if eval_change >= 1.5 else 0
+    # Group into games
+    games = []
+    current_game = []
+    prev_move_num = 999
+    for move in all_moves:
+        if move["move_number"] <= prev_move_num and current_game:
+            games.append(current_game)
+            current_game = []
+        current_game.append(move)
+        prev_move_num = move["move_number"]
+    if current_game:
+        games.append(current_game)
+
+    print(f"Total games: {len(games)}")
+
+    random.seed(42)
+    random.shuffle(games)
+    games = games[:500000]
+
+    # Normalization stats
+    print("Computing normalization stats...")
+    sample_moves = []
+    for g in games[:2000]:
+        sample_moves.extend(g)
+    sample = np.array([
+        [float(m.get(f, 0) or 0) for f in FEATURES]
+        for m in sample_moves
+    ], dtype=np.float32)
+    mean = sample.mean(axis=0)
+    std = sample.std(axis=0) + 1e-8
+    np.save("../data/mean.npy", mean)
+    np.save("../data/std.npy", std)
+
+    # Split
+    n = len(games)
+    train_games = games[:int(n * 0.7)]
+    val_games = games[int(n * 0.7):int(n * 0.85)]
+    test_games = games[int(n * 0.85):]
+
+    print(f"Train: {len(train_games)} | Val: {len(val_games)} | Test: {len(test_games)}")
+
+    print("Building datasets...")
+    train_ds = ChessDataset(train_games, mean, std)
+    val_ds = ChessDataset(val_games, mean, std)
+    test_ds = ChessDataset(test_games, mean, std)
+
+    print(f"Train sequences: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+
+    # Weighted sampler
+    labels = np.array([s[2] for s in train_ds.samples])
+    blunder_w = 1.0 / (labels.mean() + 1e-8)
+    normal_w = 1.0 / (1 - labels.mean() + 1e-8)
+    weights = np.where(labels == 1, blunder_w, normal_w)
+    sampler = WeightedRandomSampler(weights, len(weights))
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = BlunderPredictor(
+        input_size=len(FEATURES),
+        hidden_size=256,
+        num_layers=3,
+        dropout=0.4,
+        board_enc_size=64,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    criterion = nn.BCELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    EARLY_STOP = 8
+
+    print("\nTraining...")
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0
+        for x_tab, x_board, y_batch in train_loader:
+            x_tab = x_tab.to(DEVICE)
+            x_board = x_board.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+            optimizer.zero_grad()
+            preds = model(x_tab, x_board)
+            loss = criterion(preds, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x_tab, x_board, y_batch in val_loader:
+                x_tab = x_tab.to(DEVICE)
+                x_board = x_board.to(DEVICE)
+                y_batch = y_batch.to(DEVICE)
+                preds = model(x_tab, x_board)
+                val_loss += criterion(preds, y_batch).item()
+
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+        scheduler.step(avg_val)
+
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), "../data/model.pt")
+            torch.save(model.state_dict(), "/workspace/model.pt")
+            print(f"  Saved best model")
         else:
-            moves[i]["is_blunder"] = 0
+            patience_counter += 1
+            if patience_counter >= EARLY_STOP:
+                print(f"\nEarly stopping at epoch {epoch+1}")
+                break
 
-    moves[0]["is_blunder"] = 0
-    return moves
+    # Test
+    print("\nEvaluating on test set...")
+    model.load_state_dict(torch.load("../data/model.pt"))
+    model.eval()
+
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for x_tab, x_board, y_batch in test_loader:
+            preds = model(x_tab.to(DEVICE), x_board.to(DEVICE))
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(y_batch.numpy())
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    auc = roc_auc_score(all_labels, all_preds)
+    binary_preds = (all_preds > 0.5).astype(int)
+
+    print(f"\nTest AUC: {auc:.4f}")
+    print(classification_report(all_labels, binary_preds, target_names=["Normal", "Blunder"]))
 
 if __name__ == "__main__":
-    pgn_files = glob.glob("data/raw/*.pgn")
-    output_path = "data/all_features.json"
-    MAX_GAMES = 50000
-
-    all_moves = []
-    game_count = 0
-    skipped = 0
-    done = False
-
-    for pgn_file in pgn_files:
-        if done:
-            break
-        print(f"Processing {pgn_file}...")
-        with open(pgn_file, encoding="utf-8") as f:
-            while True:
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    break
-                try:
-                    moves = parse_game(game)
-                    evals_present = sum(1 for m in moves if m["eval"] is not None)
-                    if len(moves) >= 20 and evals_present >= 10:
-                        all_moves.extend(moves)
-                        game_count += 1
-                        if game_count % 5000 == 0:
-                            print(f"  {game_count} games, {len(all_moves)} moves...")
-                        if game_count >= MAX_GAMES:
-                            done = True
-                            break
-                    else:
-                        skipped += 1
-                except Exception:
-                    skipped += 1
-                    continue
-
-        print(f"  Finished {pgn_file}: {game_count} games so far")
-
-    blunders = sum(1 for m in all_moves if m.get("is_blunder") == 1)
-    print(f"\nDone!")
-    print(f"Games: {game_count} | Skipped: {skipped}")
-    print(f"Total moves: {len(all_moves)}")
-    print(f"Blunders: {blunders} ({100*blunders/len(all_moves):.1f}%)")
-
-    with open(output_path, "w") as f:
-        json.dump(all_moves, f)
-    print(f"Saved to {output_path}")
+    train()
