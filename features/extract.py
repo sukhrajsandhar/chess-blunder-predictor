@@ -1,3 +1,4 @@
+import chess
 import chess.pgn
 import re
 import json
@@ -9,6 +10,42 @@ def clk_to_seconds(clk_str):
     h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
     return h * 3600 + m * 60 + s
 
+def get_game_phase(board, move_number):
+    total_material = sum(
+        len(board.pieces(pt, c)) * val
+        for pt, val in [(chess.QUEEN,9),(chess.ROOK,5),(chess.BISHOP,3),(chess.KNIGHT,3)]
+        for c in [chess.WHITE, chess.BLACK]
+    )
+    if move_number <= 10:
+        return 0
+    elif total_material <= 20:
+        return 2
+    else:
+        return 1
+
+def board_to_tensor(board):
+    piece_map = {
+        (chess.PAWN,   chess.WHITE): 0,
+        (chess.KNIGHT, chess.WHITE): 1,
+        (chess.BISHOP, chess.WHITE): 2,
+        (chess.ROOK,   chess.WHITE): 3,
+        (chess.QUEEN,  chess.WHITE): 4,
+        (chess.KING,   chess.WHITE): 5,
+        (chess.PAWN,   chess.BLACK): 6,
+        (chess.KNIGHT, chess.BLACK): 7,
+        (chess.BISHOP, chess.BLACK): 8,
+        (chess.ROOK,   chess.BLACK): 9,
+        (chess.QUEEN,  chess.BLACK): 10,
+        (chess.KING,   chess.BLACK): 11,
+    }
+    tensor = [[[0]*8 for _ in range(8)] for _ in range(12)]
+    for square, piece in board.piece_map().items():
+        rank = square // 8
+        file = square % 8
+        channel = piece_map[(piece.piece_type, piece.color)]
+        tensor[channel][rank][file] = 1
+    return tensor
+
 def parse_game(game):
     board = game.board()
     moves = []
@@ -16,6 +53,21 @@ def parse_game(game):
     prev_clk_black = None
     time_spent_history = []
     eval_history = []
+
+    try:
+        white_elo = int(game.headers.get("WhiteElo", 1500))
+    except:
+        white_elo = 1500
+    try:
+        black_elo = int(game.headers.get("BlackElo", 1500))
+    except:
+        black_elo = 1500
+
+    try:
+        tc = game.headers.get("TimeControl", "600+0")
+        base_time = int(tc.split("+")[0]) if "+" in tc else int(tc)
+    except:
+        base_time = 600
 
     node = game
     move_number = 0
@@ -33,6 +85,7 @@ def parse_game(game):
 
         is_white = (move_number % 2 == 1)
         current_player = "white" if is_white else "black"
+        player_elo = white_elo if is_white else black_elo
 
         if is_white:
             time_spent = (prev_clk_white - clk_seconds) if (prev_clk_white is not None and clk_seconds is not None) else 0
@@ -55,6 +108,7 @@ def parse_game(game):
             eval_trend = 0.0
 
         legal_moves = board.legal_moves.count()
+        game_phase = get_game_phase(board, move_number)
 
         white_material = sum(
             len(board.pieces(pt, chess.WHITE)) * val
@@ -65,6 +119,8 @@ def parse_game(game):
             for pt, val in [(chess.PAWN,1),(chess.KNIGHT,3),(chess.BISHOP,3),(chess.ROOK,5),(chess.QUEEN,9)]
         )
         material_balance = white_material - black_material
+
+        board_tensor = board_to_tensor(board)
 
         moves.append({
             "move_number": move_number,
@@ -78,6 +134,10 @@ def parse_game(game):
             "eval_trend": round(eval_trend, 3),
             "legal_moves": legal_moves,
             "material_balance": material_balance,
+            "player_elo": player_elo,
+            "base_time": base_time,
+            "game_phase": game_phase,
+            "board": board_tensor,
         })
 
         board.push(next_node.move)
@@ -101,12 +161,16 @@ def parse_game(game):
 if __name__ == "__main__":
     pgn_files = glob.glob("data/raw/*.pgn")
     output_path = "data/all_features.json"
+    MAX_GAMES = 50000
 
     all_moves = []
     game_count = 0
     skipped = 0
+    done = False
 
     for pgn_file in pgn_files:
+        if done:
+            break
         print(f"Processing {pgn_file}...")
         with open(pgn_file, encoding="utf-8") as f:
             while True:
@@ -119,13 +183,18 @@ if __name__ == "__main__":
                     if len(moves) >= 20 and evals_present >= 10:
                         all_moves.extend(moves)
                         game_count += 1
+                        if game_count % 5000 == 0:
+                            print(f"  {game_count} games, {len(all_moves)} moves...")
+                        if game_count >= MAX_GAMES:
+                            done = True
+                            break
                     else:
                         skipped += 1
                 except Exception:
                     skipped += 1
                     continue
 
-        print(f"  Running total: {game_count} games, {len(all_moves)} moves")
+        print(f"  Finished {pgn_file}: {game_count} games so far")
 
     blunders = sum(1 for m in all_moves if m.get("is_blunder") == 1)
     print(f"\nDone!")
